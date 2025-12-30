@@ -1,0 +1,231 @@
+version: '3.8'
+
+services:
+  # PostgreSQL - Primary database for Order Service
+  postgres-orders:
+    image: postgres:15-alpine
+    container_name: postgres-orders
+    environment:
+      POSTGRES_DB: orders_db
+      POSTGRES_USER: orderuser
+      POSTGRES_PASSWORD: orderpass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-orders-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orderuser -d orders_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # PostgreSQL - Database for Inventory Service
+  postgres-inventory:
+    image: postgres:15-alpine
+    container_name: postgres-inventory
+    environment:
+      POSTGRES_DB: inventory_db
+      POSTGRES_USER: inventoryuser
+      POSTGRES_PASSWORD: inventorypass
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-inventory-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U inventoryuser -d inventory_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis - Caching layer for Notification Service
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Zookeeper - Required for Kafka (will be replaced by KRaft in production)
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
+
+  # Kafka - Event streaming platform
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Elasticsearch - Search and analytics engine
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Kibana - Elasticsearch visualization (optional but useful)
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    container_name: kibana
+    depends_on:
+      - elasticsearch
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5601/api/status || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Kafka UI - Web interface for Kafka management (optional but useful)
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      - kafka
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+
+  # Microservices
+  
+  # Order Service - REST API for creating orders
+  order-service:
+    build:
+      context: .
+      dockerfile: ./order-service/Dockerfile
+    container_name: order-service
+    depends_on:
+      postgres-orders:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8001:8001"
+    environment:
+      DATABASE_URL: postgresql://orderuser:orderpass@postgres-orders:5432/orders_db
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    volumes:
+      - ./shared:/app/shared:ro
+    restart: unless-stopped
+
+  # Inventory Service - Manages product inventory
+  inventory-service:
+    build:
+      context: .
+      dockerfile: ./inventory-service/Dockerfile
+    container_name: inventory-service
+    depends_on:
+      postgres-inventory:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://inventoryuser:inventorypass@postgres-inventory:5432/inventory_db
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    volumes:
+      - ./shared:/app/shared:ro
+    restart: unless-stopped
+
+  # Notification Service - Sends customer notifications
+  notification-service:
+    build:
+      context: .
+      dockerfile: ./notification-service/Dockerfile
+    container_name: notification-service
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    volumes:
+      - ./shared:/app/shared:ro
+    restart: unless-stopped
+
+  # Search Service - Indexes orders in Elasticsearch
+  search-service:
+    build:
+      context: .
+      dockerfile: ./search-service/Dockerfile
+    container_name: search-service
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      ELASTICSEARCH_HOST: elasticsearch
+      ELASTICSEARCH_PORT: 9200
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    volumes:
+      - ./shared:/app/shared:ro
+    restart: unless-stopped
+
+volumes:
+  postgres-orders-data:
+  postgres-inventory-data:
+  redis-data:
+  zookeeper-data:
+  zookeeper-logs:
+  kafka-data:
+  elasticsearch-data:
+
+networks:
+  default:
+    name: event-driven-network
